@@ -1,0 +1,1 @@
+DrivenData the host of the Micorosft compeition provided rules allowing competitors to post the code and work, but no official datasets could be posted training or test.
