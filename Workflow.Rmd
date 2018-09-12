@@ -1,0 +1,866 @@
+---
+title: "Microsoft Capstone: DAT102x: Predicting Heart Disease Mortality"
+output: html_notebook
+author: "Christohper Fraher"
+---
+
+
+
+```{r}
+## Load required packages
+
+if("pacman" %in% rownames(installed.packages()) == FALSE) {
+  install.packages("pacman")  
+}
+
+
+
+library(pacman)
+
+pacman::p_load(tidyverse, here, lubridate, caret, randomForest, RANN, jtools, doSNOW, plotly, corrplot, mice, VIM, lime) 
+
+```
+
+
+```{r}
+## Set up environment variables
+
+rm(list=ls())
+
+# Global prediction model
+#project.preProcPredictImputeValues <- NULL
+
+```
+
+
+```{r Prepare Data Functions }
+
+
+
+
+# Function cleans up data, creates dummy vars, and returns imputated information
+project.function_prepare_data <- function(project.modified_dataset, project.outcomecolumn = FALSE, project.outcomecolumn_name = NULL) {
+
+# Convert values to factors
+  
+project.modified_dataset <- project.modified_dataset %>% mutate(area__rucc = as.factor(area__rucc), 
+                                                                area__urban_influence = as.factor(area__urban_influence), 
+                                                                econ__economic_typology = as.factor(econ__economic_typology), 
+                                                                yr = as.factor(yr))
+
+# Feature generation
+#Break area__rucc down to simply metro and not metro
+project.modified_dataset$area__rucc__metro <- as.logical(project.modified_dataset$area__rucc %in% 
+  c("Metro - Counties in metro areas of 1 million population or more", 
+    "Metro - Counties in metro areas of 250,000 to 1 million population", 
+    "Metro - Counties in metro areas of fewer than 250,000 population"))
+
+# Create an 18-64 window
+project.modified_dataset$demo__pct_between_18_and_65 <- 1 - project.modified_dataset$demo__pct_below_18_years_of_age - project.modified_dataset$demo__pct_aged_65_years_and_older
+
+
+# Convert to Log
+#project.modified_dataset$health__pop_per_dentist <- log(project.modified_dataset$health__pop_per_dentist)
+#project.modified_dataset$health__pop_per_primary_care_physician <- log(project.modified_dataset$health__pop_per_primary_care_physician)
+
+project.modified_dataset
+
+}
+
+
+# Select the Data
+project.function_select_data <- function(project.modified_dataset, project.outcomecolumn = FALSE, project.outcomecolumn_name = NULL) {
+  
+project.outcomecolumn_data <- NULL
+
+if(project.outcomecolumn) {
+  project.outcomecolumn_data <- project.modified_dataset %>% select("row_id", project.outcomecolumn_name)
+}
+
+
+project.modified_dataset <- project.modified_dataset %>% select("row_id",
+                                                                # AREA
+                                                                "area__rucc",
+                                                                #"area__rucc__metro",
+                                                                "area__urban_influence",
+                                                                
+                                                                # ECON
+                                                                "econ__economic_typology",
+                                                                
+                                                                "econ__pct_civilian_labor", # Tableau - *Civilian Labor
+                                                                "econ__pct_unemployment", # Tableau - *Unemployment
+                                                                "econ__pct_uninsured_adults", # Tableau - *Uninsured Adults
+                                                                "econ__pct_uninsured_children", # Tableau - ??? * Uninsured Children
+                                                                
+                                                                # HEALTH
+                                                                "health__pct_adult_obesity", # Tableau - Adult Obesity
+                                                                "health__pct_diabetes", # Tableau - Diabetes
+                                                                "health__pct_low_birthweight", # Not including not a direct influence
+                                                                "health__pct_adult_smoking", # Tableau - Smoking
+                                                                #"health__pct_excessive_drinking", # 30% missing data
+                                                                "health__pct_physical_inacticity", # Tableau - *Inactivity
+                                                                "health__air_pollution_particulate_matter", # Tebleau - *Pollution
+                                                                #"health__homicides_per_100k", # Not heart disease
+                                                                #"health__motor_vehicle_crash_deaths_per_100k", # Not heart disease
+                                                                #"health__pop_per_dentist", # Not including since it is not pcp
+                                                                "health__pop_per_primary_care_physician", #Tableau - *PCP Per Capita 1 & 2
+                                                                
+                                                                # DEMO
+                                                                "demo__pct_female", # Tableau - *Female
+                                                                "demo__pct_below_18_years_of_age", # Tableau - *Under18
+                                                                "demo__pct_between_18_and_65",
+                                                                "demo__pct_aged_65_years_and_older", # Tableau - *Over 65
+                                                                "demo__pct_hispanic", # Tableau - *Race/Eth
+                                                                "demo__pct_non_hispanic_african_american", # Tableau - *Race/Eth
+                                                                "demo__pct_non_hispanic_white", # Tableau - *Race/Eth
+                                                                "demo__pct_asian", # Tableau - *Race/Eth
+                                                                "demo__pct_american_indian_or_alaskan_native", # Tableau - *Race/Eth
+                                                                
+                                                                
+                                                                "demo__pct_adults_less_than_a_high_school_diploma", # Tableau - *Education and Heart Disease                 
+                                                                "demo__pct_adults_with_high_school_diploma", # Tableau - *Education and Heart Disease
+                                                                "demo__pct_adults_with_some_college", # Tableau - *Education and Heart Disease
+                                                                "demo__pct_adults_bachelors_or_higher", # Tableau - *Education and Heart Disease
+                                                                
+                                                                
+                                                                #"demo__birth_rate_per_1k", # Confound
+                                                                "demo__death_rate_per_1k"#, # Confound
+                                                                
+                                                                
+                                                                #"yr" # Tableau - Removed Tableau - *Deaths by Area_Rucc by Year
+                                                                )
+
+
+
+if(project.outcomecolumn) {
+  project.modified_dataset <- project.modified_dataset %>% inner_join(project.outcomecolumn_data, by = "row_id")
+}
+
+project.modified_dataset
+  
+}
+
+# Impute the Data or Return Complete cases only
+project.function_handle_missing_data <- function(project.modified_dataset, use_process = "impute", project.outcomecolumn = FALSE, project.outcomecolumn_name = NULL) {
+  
+if(use_process == "impute") {
+project.values_imputed <- NULL
+
+# Impute with MICE (Builds 5 models)
+if(project.outcomecolumn) {
+  project.values_imputed <- mice(project.modified_dataset, m=1, maxit = 50, method = 'sample', seed = 500, exclude = c('row_id', project.outcomecolumn_name), print = FALSE)
+  
+}
+else {
+  project.values_imputed <- mice(project.modified_dataset, m=1, maxit = 50, method = 'sample', seed = 500, exclude = c('row_id'), print = FALSE)
+}
+
+
+results <- project.values_imputed
+
+}
+  else if(use_process == "complete") {
+    results <- project.modified_dataset[complete.cases(project.modified_dataset),]
+  }
+  
+  results
+  
+}
+
+```
+
+
+
+```{r}
+## Load the training dataset
+
+project.training_values <- read_csv("Data/train_values.csv")
+project.training_labels <- read_csv("Data/train_labels.csv")
+
+## Convert level data to factors
+
+project.training_values2 <- project.training_values %>% mutate(area__rucc = as.factor(area__rucc), area__urban_influence = as.factor(area__urban_influence), econ__economic_typology = as.factor(econ__economic_typology), yr = as.factor(yr))
+
+
+
+```
+
+Only 33% of the training data is not missing any values. The highest number of missing values include: 61.5% of health__pop_per_primary_care_physician are missing, 30.6% of health__homicides_per_100k, 14.5% of health__pct_excessive_drinking, and 13.0% of motor vehicle crash deaths per 100k is missing. There are more values which are missing data, but they continue to drop and are below 10%
+
+```{r fig.width=12, fit.height = 8, fig.asp=1}
+
+#md.pattern(project.pattern)
+
+project.mice_plot <- aggr(project.training_values, col=c('navyblue','yellow'),
+                    numbers=TRUE, sortVars=TRUE, only.miss= TRUE,
+                    labels=names(project.training_values), cex.axis=.7,
+                    gap=3, ylab=c("Missing data","Pattern"))
+
+```
+
+
+
+```{r}
+## Merge labels with values
+project.training_values3 <- project.training_values2 %>% inner_join(project.training_labels, by = "row_id")
+
+```
+
+
+
+```{r}
+## Get the summary data
+
+## Summary
+summary(project.training_values3)
+
+## Mean / SD
+mean(project.training_values3$heart_disease_mortality_per_100k, na.rm = T)
+sd(project.training_values3$heart_disease_mortality_per_100k, na.rm = T)
+
+```
+
+
+
+
+
+```{r}
+## Graph the data
+
+## Look at distribution of mortality
+hist(project.training_values3$heart_disease_mortality_per_100k, breaks = 20, xlim = c(0, 600), main = "Histogram of mortality rate")
+
+
+```
+```{r}
+
+## Median breakdown by Rural Urban Community Codes
+
+## Metro
+project.training_values3 %>% filter(as.integer(area__rucc) %in% c(1:4), !is.na(heart_disease_mortality_per_100k)) %>% summarise(median = median(heart_disease_mortality_per_100k))
+
+## Non-metro
+project.training_values3 %>% filter(!as.integer(area__rucc) %in% c(1:4), !is.na(heart_disease_mortality_per_100k)) %>% summarise(median = median(heart_disease_mortality_per_100k))
+
+
+
+```
+
+It is shown here that the median mortality rates per 100k are lower in metro areas vs non-metro areas by a rate of less than 100 deaths per 100k.
+
+```{r}
+## Is there a correlation between birth rate and heart disease mortatility rate
+cor(project.training_values3$demo__birth_rate_per_1k, project.training_values3$heart_disease_mortality_per_100k)
+
+
+plot(log(project.training_values3$demo__birth_rate_per_1k), log(project.training_values3$heart_disease_mortality_per_100k), xlab = "Birth Rate per 1k", ylab = "Mortality per 100k")
+```
+
+It would appear there is not a strong or obvious correlation between heart rate and heart disease mortality.
+
+```{r}
+
+# Build a linear model for Excessive Drinking vs Hear Disease Mortality
+project.model_drink <- lm(heart_disease_mortality_per_100k ~ health__pct_excessive_drinking, project.training_values3)
+
+# Plot the linear regression to check assumptions
+plot(project.model_drink)
+
+
+```
+For additional help, the website https://data.library.virginia.edu/diagnostic-plots/ discusses how to review plots for linear regression.
+
+The four assumptions checked here do hold for a linear regression on the Excessive Drinking vs Heart Disease Mortality model. 
+
+###Residuals vs Fitted:
+The data points do not appear to indicate any noticeable patterns, and all data points remain balanced around 0.
+
+###Normal Q-Q:
+The data elements stay close to the line without any end veering from it, indicating a normally distributed data set.
+
+###Scale-Location:
+Homoscedasticity, equal variance, holds as the data points appear to spread evenly along the 0 line.
+
+###Residuals vs Leverage:
+Finally, no values appear to fall within a Cook's distance, which would indicate exclusion of specific outliers would directly influence the regression.
+
+
+
+```{r}
+# Equation of the line
+eq = paste0("y = ", round(project.model_drink$coefficients[2],1), "*x + ", round(project.model_drink$coefficients[1],1))
+
+# Plot the points and overlay the linear model
+ggplot(data = project.training_values3, aes(x = health__pct_excessive_drinking, y = heart_disease_mortality_per_100k)) + geom_point() + geom_abline(intercept = project.model_drink$coefficients["(Intercept)"], slope = project.model_drink$coefficients["health__pct_excessive_drinking"], color = "red", size = 1.5) +   ggtitle(eq)
+```
+
+```{r}
+summary(project.model_drink)
+```
+
+### Evaluation
+The regression indicates that there is a significant negative correlation with excessive drinking to hear disease mortality (p < 0.05).
+
+```{r}
+
+# Build model for Smoking vs Heart Disease Mortatality
+project.model_smoking <- lm(heart_disease_mortality_per_100k ~ health__pct_adult_smoking, project.training_values3)
+
+# Plot the linear regression to check assumptions
+plot(project.model_smoking)
+
+```
+
+Assumptions again appear to hold true when reviewing Adult Smoking vs Heart Disease Mortality Rate.
+
+```{r}
+# Equation of the line
+eq_smoking = paste0("y = ", round(project.model_smoking$coefficients[2],1), "*x + ", round(project.model_smoking$coefficients[1],1))
+
+# Plot the points and overlay the linear model
+coeff_smoking = coefficients(project.model_smoking)
+
+ggplot(data = project.training_values3, aes(x = health__pct_adult_smoking, y = heart_disease_mortality_per_100k)) + geom_point() + geom_abline(intercept = coeff_smoking["(Intercept)"], slope = coeff_smoking["health__pct_adult_smoking"], color = "red", size = 1.5) + ggtitle(eq_smoking)
+
+
+
+```
+```{r}
+summary(project.model_smoking)
+```
+
+A linear model of Adult Smoking vs Heart Disease Mortality indicate a significant positive correlation (p < 0.05).
+
+```{r}
+
+# Metro
+project.training_values3 %>% filter(demo__pct_aged_65_years_and_older >= .2, str_detect(area__rucc, "^Metro")) %>% summarise(mean = mean(heart_disease_mortality_per_100k), median = median(heart_disease_mortality_per_100k), min = min(heart_disease_mortality_per_100k), max = max(heart_disease_mortality_per_100k))
+
+project.training_values3 %>% filter(demo__pct_aged_65_years_and_older < .2, str_detect(area__rucc, "^Metro")) %>% summarise(mean = mean(heart_disease_mortality_per_100k), median = median(heart_disease_mortality_per_100k), min = min(heart_disease_mortality_per_100k), max = max(heart_disease_mortality_per_100k))
+
+# Non-metro
+project.training_values3 %>% filter(demo__pct_aged_65_years_and_older >= .2, str_detect(area__rucc, "^Non")) %>% summarise(mean = mean(heart_disease_mortality_per_100k), median = median(heart_disease_mortality_per_100k), min = min(heart_disease_mortality_per_100k), max = max(heart_disease_mortality_per_100k))
+
+project.training_values3 %>% filter(demo__pct_aged_65_years_and_older < .2, str_detect(area__rucc, "^Non")) %>% summarise(mean = mean(heart_disease_mortality_per_100k), median = median(heart_disease_mortality_per_100k), min = min(heart_disease_mortality_per_100k), max = max(heart_disease_mortality_per_100k))
+
+
+# Both Metro and Non metro, compare heard disease mortality between relatively older populations and those who are not
+project.training_values3 %>% filter(demo__pct_aged_65_years_and_older >= .2) %>% summarise(mean = mean(heart_disease_mortality_per_100k), median = median(heart_disease_mortality_per_100k), min = min(heart_disease_mortality_per_100k), max = max(heart_disease_mortality_per_100k))
+
+project.training_values3 %>% filter(demo__pct_aged_65_years_and_older < .2) %>% summarise(mean = mean(heart_disease_mortality_per_100k), median = median(heart_disease_mortality_per_100k), min = min(heart_disease_mortality_per_100k), max = max(heart_disease_mortality_per_100k))
+
+
+
+
+```
+When looking at the breakdown of heart disease mortality rates by comparing relatively older populations, populations with more than 20% of their populous being 65 or older, to those who are not relatively older show a large decrease in the median value for the latter. Looking at the same split but further grouped into Metro and Non-metro, the sizable differences remain in the same direction, but there is a larger difference for Non-metro counties.
+
+
+One discovery, when you impute a dataset, make sure to not include the row_id. Including this will force it to be part of the analysis forcing it to be normalized along with the rest of the dataset.
+
+
+
+### Correlations
+
+```{r fig.width=12, fig.asp=1}
+
+project.training_values3_numeric <- project.training_values3[, sapply(project.training_values3, is.numeric)]
+
+project.training_values3_numeric_complete <- project.training_values3_numeric[complete.cases(project.training_values3_numeric),]
+
+project.training_values3_numeric_complete <- project.training_values3_numeric_complete %>% select(-one_of("row_id", "health__homicides_per_100k", "health__pct_excessive_drinking", "health__motor_vehicle_crash_deaths_per_100k"))
+
+project.training_values3_numeric_corr <- round(cor(project.training_values3_numeric_complete, use = "complete.obs", method="pearson"), 1)
+
+project.training_values3_numeric_corr_res <- cor.mtest(project.training_values3_numeric_complete, conf.level = 0.95)
+
+corrplot(project.training_values3_numeric_corr, p.mat = project.training_values3_numeric_corr_res$p, method = "circle", type = "upper",
+         sig.level = c(.001), pch.cex = .9, tl.cex = 0.7,
+         insig = "label_sig", pch.col = "white", order = "AOE")
+
+```
+
+
+
+### Removing Values
+
+The problem asks for a model that can be used to help predict the number of deaths from heart disease, of which many of the factors in this dataset could help indicate. There are those features though that a medical doctor, or subject matter expert may say do not have a medical signifcance to the prediction. Having such variables in the training model may in fact cause overfitting. The number of births may have some relation, if for example we were to run a linear regression on the rate of heart disease looking at rate of births alone, it would come out as a positve correlation, by a factor of 3 for every 1,000 births (see plot below). Does this mean that for every child born, more people are likely to die from heart disease? More than likely not, but that is not saying there is absolutely no releation, but this variable may overfit the model based on the data though.
+
+Along with the removal of birth rate, death rate is also remove as the number of deaths per 1,000 would be inclusive of those who died due to heart disease. Finally, homicides and motor vehicle crash deaths were removed because they would not be considered medically relavent in this case. There may be correlation, but proving causation would take a lot more to justify in a model.
+
+* health__homicides_per_100k - Deaths by homicide per 100,000 population (National Center for Health Statistics)
+* health__motor_vehicle_crash_deaths_per_100k  - Deaths by motor vehicle crash per 100,000 population (National Center for Health Statistics)
+* demo__birth_rate_per_1k - Births per 1,000 of population (US Census Population Estimates)
+* demo__death_rate_per_1k - Deaths per 1,000 of population (US Census Population Estimates)
+
+
+
+```{r}
+
+project.model_births <- lm(heart_disease_mortality_per_100k ~ demo__birth_rate_per_1k, project.training_values3)
+
+plot(project.model_births)
+
+# Plot the points and overlay the linear model
+coeff_births = coefficients(project.model_births)
+
+ggplot(data = project.training_values3, aes(x = demo__birth_rate_per_1k, y = heart_disease_mortality_per_100k)) + geom_point() + geom_abline(intercept = coeff_births["(Intercept)"], slope = coeff_births["demo__birth_rate_per_1k"], color = "red", size = 1.5) 
+
+
+project.training_values4 <- project.training_values3
+
+```
+
+
+
+
+
+
+### Analyzing Missing Data
+A brief analysis of each feature in the training dataset indicates most of the values exist, many of which having all data or missing under 10% of the total values. After calculating and ordering based on percent missing, 4 values indicate more than 10% of the data as NA: health__pct_excessive_drinking and health__pct_adult_smoking, about 30% and 15% respectively. Earlier in the analysis it was indicated that excessive drinking had a negative correlation with the number of heart disease related deaths. This fact is counter intuitive to data collected by the American Heart Association. According to the AHA, drinking can increase levels of chemicals associated with cardiovascular risk factors [link](http://www.heart.org/HEARTORG/HealthyLiving/HealthyEating/Nutrition/Alcohol-and-Heart-Health_UCM_305173_Article.jsp#.W0aiD9JKj7w). It is possible that having one-third of the data missing may be masking the true correlation, and imputing that large of a dataset may bias the model toward higher drinking indicates better heart health. 
+
+In turn, the next largest group with missing values is adult smoking at 15%. In this case 85% of the data is available, and it does show the expected positive correlation with the number of heart disease deaths. In this case we will use an imputation method on this variable.
+
+
+
+```{r Analyze Missing Data}
+
+project.missing_data <- t(as.data.frame(sapply(project.training_values4, function(x, records) round(sum(is.na(x))/records * 100, digits = 2), count(project.training_values4))))
+
+project.missing_data <- cbind(project.missing_data, rownames(project.missing_data))
+
+project.missing_data <- as.data.frame(project.missing_data, optional = FALSE, make.names = TRUE)
+
+
+project.missing_data$V1 <- as.numeric(as.character(project.missing_data$V1))
+
+project.missing_data <- project.missing_data[order(project.missing_data$V1),]
+
+project.missing_data_top10 <- project.missing_data %>% filter(V1 >= 10)
+
+# Fitting Labels 
+par(las=2) # make label text perpendicular to axis
+par(mar=c(10,16,4,2)) # increase y-axis margin.
+
+barplot(project.missing_data_top10$V1, main="test", names.arg = project.missing_data_top10$V2, horiz = TRUE, cex.names=0.8)
+
+project.training_values5 <- project.training_values4
+
+```
+
+
+
+
+Missing data can be indicative of other possible factors in the outcome, such as there may be a possible correlation between more rural areas and a missing health related variable due to a lack of an organization tracking a data point. Or maybe the data was not valid and was not included in the dataset. Either way, the missing values may be helpful to track even after imputation. Therefore, for every feature that has missing data, a corresponding feature will be engineered to track this.
+
+
+
+A review of possible correlations in the data indicate possible confounding when looking at education with respect to the percent of the civilian labor force along with unemployment rates with respect to the same variable. Highly correlated variables include: demo__pct_adults_less_than_a_high_school_diploma, demo__pct_adults_bachelors_or_higher, and econ__pct_civilian_labor.
+
+
+```{r}
+
+# Build a correlation matrix for all but categorical variables
+project.correlation_matrix <- cor(project.training_values5[,5:26])
+
+
+# find attributes that are highly corrected (ideally >0.75)
+highlyCorrelated <- findCorrelation(project.correlation_matrix, cutoff = 0.5)
+# print indexes of highly correlated attributes
+print(highlyCorrelated)
+
+sapply(highlyCorrelated, function(x) colnames(project.correlation_matrix)[x])
+
+
+ggplot(project.training_values5, aes(econ__pct_civilian_labor, demo__pct_adults_less_than_a_high_school_diploma)) + geom_point()
+ggplot(project.training_values5, aes(econ__pct_civilian_labor, demo__pct_adults_bachelors_or_higher)) + geom_point()
+ggplot(project.training_values5, aes(econ__pct_civilian_labor, demo__pct_adults_with_some_college)) + geom_point()
+ggplot(project.training_values5, aes(econ__pct_civilian_labor, demo__pct_adults_with_high_school_diploma)) + geom_point()
+ggplot(project.training_values5, aes(econ__pct_civilian_labor, econ__pct_unemployment)) + geom_point()
+
+
+
+
+```
+
+
+Now split the data into prediction and test.
+
+```{r}
+
+
+project.prepare_split <- project.training_values %>% inner_join(project.training_labels, by = "row_id")
+
+
+
+seed = 123
+
+set.seed(seed)
+
+#project.prepare_split <- project.prepare_split[complete.cases(project.prepare_split),]
+
+indexes <- createDataPartition(project.prepare_split$heart_disease_mortality_per_100k,
+                               times = 1,
+                               p = 0.8,
+                               list = FALSE)
+
+project.official_train_dirty <- project.prepare_split[indexes,]
+project.official_test_dirty <- project.prepare_split[-indexes,]
+
+
+
+```
+
+
+```{r # Prepare the data}
+
+
+# Training
+# Strip the outcomes
+project.official_train_outcomes <- project.official_train_dirty %>% select(row_id, heart_disease_mortality_per_100k)
+
+project.official_train <- project.function_prepare_data(project.official_train_dirty, project.outcomecolumn =  TRUE, project.outcomecolumn_name =   "heart_disease_mortality_per_100k")
+project.official_train <- project.function_select_data (project.official_train, project.outcomecolumn =  TRUE, project.outcomecolumn_name = "heart_disease_mortality_per_100k")
+project.official_train <- project.function_handle_missing_data(project.official_train, 
+                                                               use_process = "complete",  
+                                                               project.outcomecolumn = TRUE, 
+                                                               project.outcomecolumn_name = "heart_disease_mortality_per_100k")
+
+#project.official_train <- complete(project.official_train, 1)
+project.official_train <- project.official_train[,-1]
+
+
+
+```
+
+
+
+
+
+After initially building the ML models, they did not provide a very successful prediction rate. RMSE is a more precise measurement than accuracy, so it will be used to evaluate these.
+
+```{r Build the ML Model}
+
+
+
+
+# Use repeated cross validation
+#control <- trainControl(method="repeatedcv", number = 10, repeats = 5, savePredictions = TRUE)
+control <- trainControl(method="cv", number = 10, savePredictions = TRUE)
+p_process <- c( "center", "scale", "nzv", "BoxCox")  #"nzv", , "pca", , "BoxCox"
+metric <- "RMSE"
+rf_grid = expand.grid(mtry = 1:13)
+
+
+
+# Train a model
+
+
+
+```
+
+```{r}
+cl <- makeCluster(5, type = "SOCK")
+
+registerDoSNOW(cl)
+
+```
+
+
+```{r Train Linear Model}
+
+#set.seed(seed)
+#project.ml_model_lm <- train(heart_disease_mortality_per_100k ~ ., data = project.official_train, method = "lm", metric = metric, preProcess = p_process, trControl = control)
+
+
+```
+
+
+```{r kNN Model}
+# kNN
+
+#set.seed(seed)
+#project.ml_model_knn <- train(heart_disease_mortality_per_100k ~ ., data = project.official_train, method = "knn", metric = metric, preProcess = p_process, trControl = control, tuneLength = 10)
+
+
+```
+
+```{r Logistic Regression}
+
+# Logistic Regression
+#set.seed(seed)
+#project.ml_model_glm <- train(heart_disease_mortality_per_100k ~ ., data = project.official_train, method = "glm", metric = metric, preProcess = p_process, trControl = control)
+
+
+```
+
+```{r Random Forest}
+
+# Random Forest
+#set.seed(seed)
+#project.ml_model_rf <- train(heart_disease_mortality_per_100k ~ . -row_id, data = project.official_train, method="rf", metric = metric, preProcess = p_process, trControl = control, ntrees = 500)
+
+```
+
+
+```{r GLMNET}
+
+# GLMNET
+#set.seed(seed)
+#project.ml_model_glmnet <- train(heart_disease_mortality_per_100k ~ . -row_id, data = project.official_train, method="glmnet", metric = metric, preProcess = p_process, trControl = control)
+
+
+```
+
+
+```{r Ranger}
+
+#set.seed(seed)
+#project.ml_model_ranger <- train(heart_disease_mortality_per_100k ~ ., data = project.official_train, method="ranger", metric = metric, preProcess = p_process, trControl = control, tuneGrid = rf_grid)
+
+```
+
+```{r Neural networks with Feature Extraction}
+
+#set.seed(seed)
+#project.ml_model_pcaNNet <- train(heart_disease_mortality_per_100k ~ . -row_id, data = project.official_train, method="pcaNNet", metric = metric, preProcess = p_process, trControl = control)
+
+```
+
+```{r Bayesian Generalized Linear Model}
+
+#set.seed(seed)
+#project.ml_model_bayesglm <- train(heart_disease_mortality_per_100k ~ . -row_id, data = project.official_train, method="bayesglm", metric = metric, preProcess = p_process, trControl = control)
+
+
+```
+
+```{r Bayesian Ridge Regression}
+
+#set.seed(seed)
+#project.ml_model_bridge <- train(heart_disease_mortality_per_100k ~ . -row_id, data = project.official_train, method="bridge", metric = metric, preProcess = p_process, trControl = control)
+
+```
+
+
+```{r Linear Regression with Stepwise Selection}
+
+#set.seed(seed)
+#project.ml_model_lmStepAIC <- train(heart_disease_mortality_per_100k ~ . -row_id, data = project.official_train, method="lmStepAIC", metric = metric, preProcess = p_process, trControl = control)
+
+```
+
+```{r}
+
+# Stochastic Gradient Boosting (Generalized Boosted Modeling)
+set.seed(seed)
+project.ml_model_gbm <- train(heart_disease_mortality_per_100k ~ ., data = project.official_train, method="gbm", metric = metric, preProcess = p_process, trControl = control, verbose = FALSE)
+
+```
+
+```{r}
+
+# Stochastic Gradient Boosting (Generalized Boosted Modeling)
+set.seed(seed)
+project.ml_model_gbm_5 <- train(heart_disease_mortality_per_100k ~ ., data = project.official_train, method="gbm", metric = metric, preProcess = p_process, trControl = control, tuneLength = 5, verbose = FALSE)
+
+
+```
+
+
+```{r Stochastic Gradient Boosting (gbm)}
+
+# Stochastic Gradient Boosting (Generalized Boosted Modeling)
+#set.seed(seed)
+#project.ml_model_gbm_10 <- train(heart_disease_mortality_per_100k ~ ., data = project.official_train, method="gbm", metric = metric, preProcess = p_process, trControl = control, tuneLength = 10, verbose = FALSE)
+
+
+```
+
+```{r eXtreme Gradient Boosting}
+
+#set.seed(seed)
+#project.ml_model_gbm_xgb <- train(heart_disease_mortality_per_100k ~ ., data = project.official_train, method="xgbTree", metric = metric, preProcess = p_process, trControl = control, tuneLength = 10, verbose = FALSE)
+
+
+```
+
+
+```{r Bagged CART}
+
+#set.seed(seed)
+#project.ml_model_baggedCART <- train(heart_disease_mortality_per_100k ~ .-row_id, data = project.official_train, method="treebag", metric = metric, preProcess = p_process, trControl = control)
+
+```
+
+```{r Bayesian Ridge Regression (Model Averaged)}
+
+#set.seed(seed)
+#project.ml_model_blassoAveraged <- train(heart_disease_mortality_per_100k ~ .-row_id, data = project.official_train, method="blassoAveraged", metric = metric, preProcess = p_process, trControl = control)
+
+
+```
+
+```{r Guassian Linear}
+
+#set.seed(seed)
+#project.ml_model_gaussprLinear <- train(heart_disease_mortality_per_100k ~ ., data = project.official_train[,-1], method="gaussprLinear", metric = metric, preProcess = p_process, trControl = control)
+
+
+```
+
+
+
+```{r}
+stopCluster(cl)
+```
+
+
+Had some great help from https://machinelearningmastery.com/evaluate-machine-learning-algorithms-with-r/ when starting to evaluate the models
+
+```{r Evaluate the Models}
+
+
+# Uses built in formula detection
+results <- resamples(list(#lm_model = project.ml_model_lm,
+                          #knn_model = project.ml_model_knn,
+                          #glm_model = project.ml_model_glm, 
+                          #rf_model = project.ml_model_rf, 
+                          #glmnet_model = project.ml_model_glmnet, 
+                          gbm_model = project.ml_model_gbm,
+                          gbm_5_model = project.ml_model_gbm_5
+                          #gbm_10_model = project.ml_model_gbm_10
+                          #gbm_xgb_model = project.ml_model_gbm_xgb
+                          #ranger_model = project.ml_model_ranger#,
+                          #ANFIS_model = project.ml_model_ANFIS,
+                          #bayesglm = project.ml_model_bayesglm,
+                          #blassoAvg = project.ml_model_blassoAveraged,
+                          #gaussprLinear = project.ml_model_gaussprLinear
+                          #baggedCART = project.ml_model_baggedCART
+                          #pcaNNet_model = project.ml_model_pcaNNet
+                          ))
+
+summary(results)
+
+# boxplot comparison
+bwplot(results)
+
+# Dot-plot comparison
+dotplot(results)
+
+```
+
+
+
+```{r}
+
+project.explainer <- lime(project.official_train, project.ml_model_gbm)
+#project.explanation <- explain(project.official_train, project.explainer, n_features = 2)
+
+#plot_features(project.explanation, ncol = 1)
+
+```
+
+
+```{r}
+
+project.model_to_use <- project.ml_model_gbm_5
+
+
+# Testing
+# Strip the outcomes
+project.official_test_outcomes <- project.official_test_dirty %>% select(row_id, heart_disease_mortality_per_100k)
+
+project.official_test <- project.function_prepare_data(project.official_test_dirty)
+project.official_test <- project.function_select_data (project.official_test)
+project.official_test <- project.function_handle_missing_data(project.official_test)
+
+project.offical_test_complete <- complete(project.official_test, 1)
+
+project.test_predictions <- predict(project.model_to_use, project.offical_test_complete)
+
+project.test_predictions <- round(project.test_predictions, 0)
+
+project.test_results <- data.frame(row_id = project.offical_test_complete$row_id, heart_disease_mortality_per_100k = project.test_predictions)
+
+
+qplot(project.official_test_outcomes$heart_disease_mortality_per_100k, project.test_results$heart_disease_mortality_per_100k)
+
+```
+
+```{r Calculate RMSE of Test Data}
+
+
+RMSE(project.official_test_outcomes$heart_disease_mortality_per_100k, project.test_results$heart_disease_mortality_per_100k)
+
+```
+
+### Variable Influence
+
+```{r}
+
+summary(project.model_to_use)
+plot(project.model_to_use)
+
+
+```
+
+
+
+
+
+```{r Make the Preditions}
+
+# Load the data
+project.competition_values <- read_csv("Data/test_values.csv")
+
+# Prepare the data
+project.competition_values_prepared <- project.function_prepare_data(project.competition_values)
+
+project.competition_values_prepared <- project.function_prepare_data(project.competition_values_prepared)
+project.competition_values_prepared <- project.function_select_data (project.competition_values_prepared)
+project.competition_values_prepared <- project.function_handle_missing_data(project.competition_values_prepared)
+
+
+
+# Get the completed dataset 
+
+project.competition_values_complete <- complete(project.competition_values_prepared, 1)
+
+
+# Make predictions
+project.competition_predictions <- predict(project.model_to_use, project.competition_values_complete)
+
+# Round to integer values
+project.competition_predictions <- round(project.competition_predictions, 0)
+
+# Output the data
+output <- data.frame(row_id = project.competition_values_complete$row_id, heart_disease_mortality_per_100k = project.competition_predictions)
+
+write.csv(output, 'Results/FinalResults_62.csv', row.names = FALSE, na = "",  quote = FALSE)
+
+```
+
+After running through a few problems dealing with imputation, it was made clear that one must be careful not to include the row_id as a value in the process of imputation. Some methods of imputation normalize the data, which in turn normalizes the row_id and uses it in the calculation, starting the process off with poor training data and when run on the competition dataset, renders it useless.
+
+GBM2, which is a system that uses its own feature detection instead of feature one that uses the formula built in the early model filtering, out performs each other model, excluding RF which needs to be rerun for comparison. Additionally, the best model so far 32.7776 used MedianImpute instead of knnImpute. This was changed in order to try and fix the row_id normalization issue, but further research explainined how to properly use these methods.
+
+
+To try and improve imputation, the following methods were added ("center", "scale", "corr"), to allow for a centering and scaleing of data around a zero point to allow for more accurate comparisons between featuers. In addition, the "corr", for correlate, method was added to help reduce the influence on features where a high correlation is involved. This will help to reduce the value being over infuence by interactions.
+
+Regarding the preprocessing for the model. Like the imputations, "corr" has been added to help weed out interactions that may be occuring in the data set.
+
+
+###Key learning point: if you preprocess your training/test data a specific way, or impute a specific way, do the same with the datasets you will processing the finished ML model on.
+
+```{r}
+
+write.excel <- function(x,row.names=FALSE,col.names=TRUE,...) {
+  write.table(x,"clipboard",sep="\t",row.names=row.names,col.names=col.names,...)
+}
+ 
+#write.excel(sapply(project.training_values[,-1], function(x) data.frame(Min = min(x, na.rm = TRUE), Max = max(x, na.rm = TRUE), Mean = mean(x, na.rm = TRUE),  StdDev = sd(x, na.rm = TRUE), Missing = sum(is.na(x)))), row.names = TRUE, col.names = TRUE)
+
+```
+
+
