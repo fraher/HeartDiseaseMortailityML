@@ -9,22 +9,24 @@ output: html_document
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
-## R Markdown
+# Project Predicting Heart Disease Mortality
+The purpose of this machine learning compeition was to analyze and develop a model to predict heart disease mortality based on demographic, economic, and health related data points. Data was provided at the county level across all 50 states with the US. 
 
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+## Packages
+Analysis was performed using R with the following packages:
+- caret
+- mice
+- tidyverse
+- here
+- lubridate
+- randomForest
+- RANN
+- jtools
+- doSNOW
+- plotly
+- corrplot,
+- VIM
+- lime
 
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
-
-```{r cars}
-summary(cars)
-```
-
-## Including Plots
-
-You can also embed plots, for example:
-
-```{r pressure, echo=FALSE}
-plot(pressure)
-```
-
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+## Results
+As the outcome was a regression model, RMSE was used to measure the accuracy of the predicted values. After training a value of 31.54727 was obtained while a compeition of best score of 32.6040 was calculated indicating some overfitting to the model. Further work should be performed for a more accurate predictor system.
